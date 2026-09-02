@@ -28,6 +28,18 @@ int main(void)
     }
     /* Fixed trailer copied from the S100 golden, not calculated by the parser. */
     golden[189]=0x59; golden[190]=0x46;
+    {
+        uint8_t ack[V3_ACK_FRAME_SIZE];
+        uint16_t ack_crc;
+        assert(V3_BuildAck(golden, ack) == V3_ACK_FRAME_SIZE);
+        assert(ack[3] == V3_MESSAGE_ACK && ack[4] == 0xF0 && ack[5] == 0x01);
+        assert(memcmp(ack + 6, golden + 6, 4) == 0);
+        assert(memcmp(ack + 13, golden + 13, 4) == 0);
+        assert(ack[17] == 0x10 && ack[18] == V3_ACK_RECEIVED);
+        ack_crc = (uint16_t)(ack[19] | ((uint16_t)ack[20] << 8));
+        assert(V3_Crc(ack, 19) == ack_crc);
+        assert(V3_BuildAck(ack, ack) == 0);
+    }
     for(split=0;split<=191;++split) {
         V3_Init(&p,received); calls=0;
         feed(&p,golden,split); feed(&p,golden+split,191-split);

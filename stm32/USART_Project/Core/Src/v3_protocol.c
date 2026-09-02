@@ -12,6 +12,22 @@ uint16_t V3_Crc(const uint8_t *data, uint16_t length)
     }
     return crc;
 }
+uint16_t V3_BuildAck(const uint8_t *received_frame, uint8_t *ack_frame)
+{
+    uint16_t crc;
+    uint8_t i;
+    if (received_frame == 0 || ack_frame == 0 || received_frame[3] == V3_MESSAGE_ACK ||
+        received_frame[12] != 0U || received_frame[11] < 4U)
+        return 0;
+    ack_frame[0]=0xaaU; ack_frame[1]=0x55U; ack_frame[2]=3U; ack_frame[3]=V3_MESSAGE_ACK;
+    ack_frame[4]=received_frame[5]; ack_frame[5]=received_frame[4];
+    for (i=0;i<4U;++i) ack_frame[6U+i]=received_frame[6U+i];
+    ack_frame[10]=0U; ack_frame[11]=6U; ack_frame[12]=0U;
+    for (i=0;i<4U;++i) ack_frame[13U+i]=received_frame[13U+i];
+    ack_frame[17]=received_frame[3]; ack_frame[18]=V3_ACK_RECEIVED;
+    crc=V3_Crc(ack_frame,19U); ack_frame[19]=(uint8_t)crc; ack_frame[20]=(uint8_t)(crc>>8);
+    return V3_ACK_FRAME_SIZE;
+}
 void V3_Init(V3_Parser *p, V3_FrameCallback callback)
 {
     memset(p, 0, sizeof(*p));

@@ -8,7 +8,7 @@
 #endif
 typedef struct {
     uint32_t rx_bytes, uart_errors, overflows, restarts, start_failures;
-    uint32_t timeout_resets, debug_dropped, tx_errors;
+    uint32_t timeout_resets, ack_sent, ack_dropped, tx_errors;
     uint32_t frames, crc_errors, header_errors, last_sequence;
     uint16_t last_length;
     uint8_t last_frame[V3_MAX_FRAME];
