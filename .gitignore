@@ -1,0 +1,62 @@
+# Keil build files
+Objects/
+Listings/
+USART/
+
+*.o
+*.d
+*.crf
+*.lst
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+
+# Keil user files
+*.uvguix.*
+*.bak
+
+# CubeIDE/CubeMX temporary
+*.launch
+
+# VSCode
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# ROS2
+build/
+install/
+log/
+
+# SLAM dataset
+**/EuRoC_IMU/
+**/TUM_IMU/
+
+# ORB vocabulary archive
+*.tar.gz
+
+# ARM library
+*.lib
+
+# STM32 build
+**/Objects/
+**/Listings/
+*.o
+*.d
+*.axf
+*.hex
+*.bin
+*.map
+
+# ROS2 build
+**/build/
+**/install/
+**/log/
+
+# Python
+__pycache__/
+*.pyc

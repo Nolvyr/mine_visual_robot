@@ -1,0 +1,1621 @@
+#include "stereo-slam-node.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
+
+#include <Eigen/Geometry>
+
+#include <opencv2/core/core.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include "sensor_msgs/point_cloud2_iterator.hpp"
+
+
+using std::placeholders::_1;
+using std::placeholders::_2;
+
+
+namespace
+{
+
+/*
+ * ORB-SLAM3世界坐标系。
+ */
+constexpr const char* kOrbMapFrame =
+    "orb_map";
+
+
+/*
+ * 约30 FPS时：
+ *
+ * 30 / 3 ≈ 10 Hz
+ */
+constexpr std::uint32_t kPathPublishStride =
+    3;
+
+
+/*
+ * 防止Path无限增长。
+ */
+constexpr std::size_t kMaxPathPoses =
+    2000;
+
+
+/*
+ * ==========================================================
+ * RViz MapPoint参数
+ * ==========================================================
+ *
+ * 约30 FPS时：
+ *
+ * 30 / 15 ≈ 2 Hz
+ */
+constexpr std::uint32_t kMapPointsPublishStride =
+    15;
+
+
+/*
+ * RViz测试阶段每次最多300点。
+ */
+constexpr std::size_t kMaxPublishedMapPoints =
+    300;
+
+
+/*
+ * ==========================================================
+ * MapPoint通信Batch V2参数
+ * ==========================================================
+ */
+
+
+/*
+ * 每个通信Batch最多20条操作。
+ */
+constexpr std::size_t kMapPointsPerBatch =
+    20;
+
+
+/*
+ * 一个Batch最多允许10条UPDATE。
+ *
+ * 剩余位置用于ADD。
+ *
+ * 防止大量UPDATE导致新点永远发不出去，
+ * 也防止大量ADD导致UPDATE永远得不到机会。
+ */
+constexpr std::size_t kMaxUpdatesPerBatch =
+    10;
+
+
+/*
+ * 每15个Tracking::OK帧生成一次Batch。
+ *
+ * 约30 FPS情况下：
+ *
+ * ≈ 2 Hz
+ */
+constexpr std::uint32_t kMapBatchPublishStride =
+    15;
+
+
+/*
+ * MapPoint位置变化阈值。
+ *
+ * 当前实验初值：
+ *
+ * 0.02 m = 2 cm
+ *
+ * 位移达到或超过该值才发送UPDATE。
+ */
+constexpr float kMapPointUpdateThresholdMeters =
+    0.02F;
+
+
+/*
+ * Tracking State文字。
+ */
+const char* TrackingStateName(
+    const int state)
+{
+    switch (state)
+    {
+        case -1:
+            return "SYSTEM_NOT_READY";
+
+        case 0:
+            return "NO_IMAGES_YET";
+
+        case 1:
+            return "NOT_INITIALIZED";
+
+        case 2:
+            return "OK";
+
+        case 3:
+            return "RECENTLY_LOST";
+
+        case 4:
+            return "LOST";
+
+        case 5:
+            return "OK_KLT";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+} // namespace
+
+
+
+StereoSlamNode::StereoSlamNode(
+    ORB_SLAM3::System* pSLAM,
+    const std::string& strSettingsFile,
+    const std::string& strDoRectify)
+    :
+    Node("ORB_SLAM3_ROS2"),
+    m_SLAM(pSLAM)
+{
+    /*
+     * 读取true / false。
+     */
+    std::stringstream ss(
+        strDoRectify);
+
+
+    if (!(ss >> std::boolalpha >> doRectify))
+    {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Invalid rectify option '%s', using false",
+            strDoRectify.c_str());
+
+        doRectify = false;
+    }
+
+
+    /*
+     * ==========================================================
+     * 双目矫正参数
+     * ==========================================================
+     */
+
+    if (doRectify)
+    {
+        cv::FileStorage fsSettings(
+            strSettingsFile,
+            cv::FileStorage::READ);
+
+
+        if (!fsSettings.isOpened())
+        {
+            throw std::runtime_error(
+                "Wrong path to ORB-SLAM3 settings file: " +
+                strSettingsFile);
+        }
+
+
+        cv::Mat K_l;
+        cv::Mat K_r;
+
+        cv::Mat P_l;
+        cv::Mat P_r;
+
+        cv::Mat R_l;
+        cv::Mat R_r;
+
+        cv::Mat D_l;
+        cv::Mat D_r;
+
+
+        fsSettings["LEFT.K"] >> K_l;
+        fsSettings["RIGHT.K"] >> K_r;
+
+        fsSettings["LEFT.P"] >> P_l;
+        fsSettings["RIGHT.P"] >> P_r;
+
+        fsSettings["LEFT.R"] >> R_l;
+        fsSettings["RIGHT.R"] >> R_r;
+
+        fsSettings["LEFT.D"] >> D_l;
+        fsSettings["RIGHT.D"] >> D_r;
+
+
+        const int rows_l =
+            static_cast<int>(
+                fsSettings["LEFT.height"]);
+
+
+        const int cols_l =
+            static_cast<int>(
+                fsSettings["LEFT.width"]);
+
+
+        const int rows_r =
+            static_cast<int>(
+                fsSettings["RIGHT.height"]);
+
+
+        const int cols_r =
+            static_cast<int>(
+                fsSettings["RIGHT.width"]);
+
+
+        if (
+            K_l.empty() ||
+            K_r.empty() ||
+            P_l.empty() ||
+            P_r.empty() ||
+            R_l.empty() ||
+            R_r.empty() ||
+            D_l.empty() ||
+            D_r.empty() ||
+            rows_l == 0 ||
+            rows_r == 0 ||
+            cols_l == 0 ||
+            cols_r == 0)
+        {
+            throw std::runtime_error(
+                "Calibration parameters used to rectify "
+                "stereo images are missing");
+        }
+
+
+        /*
+         * 左目矫正Map。
+         */
+        cv::initUndistortRectifyMap(
+            K_l,
+            D_l,
+            R_l,
+            P_l.rowRange(0, 3).colRange(0, 3),
+            cv::Size(cols_l, rows_l),
+            CV_32F,
+            M1l,
+            M2l);
+
+
+        /*
+         * 右目矫正Map。
+         */
+        cv::initUndistortRectifyMap(
+            K_r,
+            D_r,
+            R_r,
+            P_r.rowRange(0, 3).colRange(0, 3),
+            cv::Size(cols_r, rows_r),
+            CV_32F,
+            M1r,
+            M2r);
+    }
+
+
+    /*
+     * ==========================================================
+     * Publisher
+     * ==========================================================
+     */
+
+    pose_pub_ =
+        this->create_publisher<
+            geometry_msgs::msg::PoseStamped>(
+                "/orbslam3/pose",
+                rclcpp::QoS(10));
+
+
+    tracking_state_pub_ =
+        this->create_publisher<
+            std_msgs::msg::Int32>(
+                "/orbslam3/tracking_state",
+                rclcpp::QoS(10));
+
+
+    path_pub_ =
+        this->create_publisher<
+            nav_msgs::msg::Path>(
+                "/orbslam3/path",
+                rclcpp::QoS(
+                    rclcpp::KeepLast(1))
+                    .reliable()
+                    .transient_local());
+
+
+    map_points_pub_ =
+        this->create_publisher<
+            sensor_msgs::msg::PointCloud2>(
+                "/orbslam3/map_points",
+                rclcpp::QoS(1));
+
+
+    /*
+     * Path统一使用orb_map。
+     */
+    path_msg_.header.frame_id =
+        kOrbMapFrame;
+
+
+    /*
+     * ==========================================================
+     * 双目Subscriber
+     * ==========================================================
+     */
+
+    const auto image_qos =
+        rclcpp::SensorDataQoS()
+            .get_rmw_qos_profile();
+
+
+    left_sub =
+        std::make_shared<
+            message_filters::Subscriber<ImageMsg>>(
+                this,
+                "/left/image_rect",
+                image_qos);
+
+
+    right_sub =
+        std::make_shared<
+            message_filters::Subscriber<ImageMsg>>(
+                this,
+                "/right/image_rect",
+                image_qos);
+
+
+    syncApproximate =
+        std::make_shared<
+            message_filters::Synchronizer<
+                ApproximateSyncPolicy>>(
+                    ApproximateSyncPolicy(10),
+                    *left_sub,
+                    *right_sub);
+
+
+    syncApproximate->registerCallback(
+        std::bind(
+            &StereoSlamNode::GrabStereo,
+            this,
+            _1,
+            _2));
+
+
+    /*
+     * ==========================================================
+     * 启动日志
+     * ==========================================================
+     */
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Stereo SLAM publishers initialized");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Pose topic: /orbslam3/pose");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Tracking state topic: "
+        "/orbslam3/tracking_state");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Path topic: /orbslam3/path");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Map points topic: "
+        "/orbslam3/map_points");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "MapPoint Batch V2 initialized: "
+        "max_points=%zu max_updates=%zu "
+        "stride=%u update_threshold=%.3f m",
+        kMapPointsPerBatch,
+        kMaxUpdatesPerBatch,
+        kMapBatchPublishStride,
+        kMapPointUpdateThresholdMeters);
+}
+
+
+
+StereoSlamNode::~StereoSlamNode()
+{
+    if (m_SLAM == nullptr)
+    {
+        return;
+    }
+
+
+    /*
+     * 先关闭ORB-SLAM3线程。
+     */
+    m_SLAM->Shutdown();
+
+
+    if (has_valid_pose_)
+    {
+        m_SLAM->SaveTrajectoryTUM(
+            "CameraTrajectory.txt");
+
+
+        m_SLAM->SaveKeyFrameTrajectoryTUM(
+            "KeyFrameTrajectory.txt");
+
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Saved CameraTrajectory.txt and "
+            "KeyFrameTrajectory.txt");
+    }
+    else
+    {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "No valid SLAM pose was generated; "
+            "trajectory files were not saved");
+    }
+}
+
+
+
+void StereoSlamNode::GrabStereo(
+    const ImageMsg::ConstSharedPtr& msgLeft,
+    const ImageMsg::ConstSharedPtr& msgRight)
+{
+    /*
+     * ==========================================================
+     * 左图
+     * ==========================================================
+     */
+
+    try
+    {
+        cv_ptrLeft =
+            cv_bridge::toCvShare(
+                msgLeft);
+    }
+    catch (const cv_bridge::Exception& e)
+    {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Left image cv_bridge exception: %s",
+            e.what());
+
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 右图
+     * ==========================================================
+     */
+
+    try
+    {
+        cv_ptrRight =
+            cv_bridge::toCvShare(
+                msgRight);
+    }
+    catch (const cv_bridge::Exception& e)
+    {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Right image cv_bridge exception: %s",
+            e.what());
+
+        return;
+    }
+
+
+    Sophus::SE3f Tcw;
+
+
+    /*
+     * 使用左目时间戳。
+     */
+    const double timestamp =
+        Utility::StampToSec(
+            msgLeft->header.stamp);
+
+
+    /*
+     * ==========================================================
+     * TrackStereo
+     * ==========================================================
+     */
+
+    if (doRectify)
+    {
+        cv::Mat imLeft;
+        cv::Mat imRight;
+
+
+        cv::remap(
+            cv_ptrLeft->image,
+            imLeft,
+            M1l,
+            M2l,
+            cv::INTER_LINEAR);
+
+
+        cv::remap(
+            cv_ptrRight->image,
+            imRight,
+            M1r,
+            M2r,
+            cv::INTER_LINEAR);
+
+
+        Tcw =
+            m_SLAM->TrackStereo(
+                imLeft,
+                imRight,
+                timestamp);
+    }
+    else
+    {
+        Tcw =
+            m_SLAM->TrackStereo(
+                cv_ptrLeft->image,
+                cv_ptrRight->image,
+                timestamp);
+    }
+
+
+    /*
+     * TrackStereo完成以后，
+     * ORB-SLAM3内部状态已经更新。
+     */
+    PublishSlamOutputs(
+        Tcw,
+        msgLeft->header);
+}
+
+
+
+void StereoSlamNode::PublishTrackedMapPoints(
+    const std_msgs::msg::Header& imageHeader)
+{
+    /*
+     * ==========================================================
+     * 获取全部活动MapPoints
+     * ==========================================================
+     */
+
+    const std::vector<ORB_SLAM3::MapPoint*> map_points =
+        m_SLAM->GetAllMapPoints();
+
+
+    if (map_points.empty())
+    {
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 自动抽样
+     * ==========================================================
+     */
+
+    const std::size_t sampling_stride =
+        std::max<std::size_t>(
+            1,
+            (
+                map_points.size() +
+                kMaxPublishedMapPoints -
+                1
+            )
+            /
+            kMaxPublishedMapPoints);
+
+
+    std::vector<Eigen::Vector3f> valid_points;
+
+
+    valid_points.reserve(
+        std::min(
+            map_points.size(),
+            kMaxPublishedMapPoints));
+
+
+    /*
+     * ==========================================================
+     * MapPoint过滤
+     * ==========================================================
+     */
+
+    for (
+        std::size_t i = 0;
+        i < map_points.size();
+        i += sampling_stride)
+    {
+        ORB_SLAM3::MapPoint* pMP =
+            map_points[i];
+
+
+        if (pMP == nullptr)
+        {
+            continue;
+        }
+
+
+        if (pMP->isBad())
+        {
+            continue;
+        }
+
+
+        const Eigen::Vector3f world_pos =
+            pMP->GetWorldPos();
+
+
+        if (
+            !std::isfinite(world_pos.x()) ||
+            !std::isfinite(world_pos.y()) ||
+            !std::isfinite(world_pos.z()))
+        {
+            continue;
+        }
+
+
+        valid_points.push_back(
+            world_pos);
+
+
+        if (
+            valid_points.size() >=
+            kMaxPublishedMapPoints)
+        {
+            break;
+        }
+    }
+
+
+    if (valid_points.empty())
+    {
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * PointCloud2
+     * ==========================================================
+     */
+
+    sensor_msgs::msg::PointCloud2 cloud_msg;
+
+
+    cloud_msg.header.stamp =
+        imageHeader.stamp;
+
+
+    cloud_msg.header.frame_id =
+        kOrbMapFrame;
+
+
+    cloud_msg.height =
+        1;
+
+
+    sensor_msgs::PointCloud2Modifier modifier(
+        cloud_msg);
+
+
+    modifier.setPointCloud2FieldsByString(
+        1,
+        "xyz");
+
+
+    modifier.resize(
+        valid_points.size());
+
+
+    sensor_msgs::PointCloud2Iterator<float>
+        iter_x(
+            cloud_msg,
+            "x");
+
+
+    sensor_msgs::PointCloud2Iterator<float>
+        iter_y(
+            cloud_msg,
+            "y");
+
+
+    sensor_msgs::PointCloud2Iterator<float>
+        iter_z(
+            cloud_msg,
+            "z");
+
+
+    for (
+        const Eigen::Vector3f& point :
+        valid_points)
+    {
+        *iter_x =
+            static_cast<float>(
+                point.x());
+
+
+        *iter_y =
+            static_cast<float>(
+                point.y());
+
+
+        *iter_z =
+            static_cast<float>(
+                point.z());
+
+
+        ++iter_x;
+        ++iter_y;
+        ++iter_z;
+    }
+
+
+    cloud_msg.is_dense =
+        true;
+
+
+    map_points_pub_->publish(
+        cloud_msg);
+}
+
+
+
+void StereoSlamNode::PrepareMapPointBatch()
+{
+    /*
+     * ==========================================================
+     * 获取当前活动MapPoints
+     * ==========================================================
+     */
+
+    const std::vector<ORB_SLAM3::MapPoint*> map_points =
+        m_SLAM->GetAllMapPoints();
+
+
+    if (map_points.empty())
+    {
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 当前地图快照
+     * ==========================================================
+     *
+     * 先复制：
+     *
+     * mnId
+     * XYZ
+     *
+     * 后面所有ADD / UPDATE判断
+     * 基于这份快照完成。
+     */
+    struct MapPointSnapshot
+    {
+        unsigned long id;
+
+        float x;
+        float y;
+        float z;
+    };
+
+
+    std::vector<MapPointSnapshot> snapshots;
+
+
+    snapshots.reserve(
+        map_points.size());
+
+
+    /*
+     * ==========================================================
+     * 生成合法MapPoint快照
+     * ==========================================================
+     */
+
+    for (
+        ORB_SLAM3::MapPoint* pMP :
+        map_points)
+    {
+        if (pMP == nullptr)
+        {
+            continue;
+        }
+
+
+        /*
+         * 当前V2忽略Bad点。
+         *
+         * DELETE V3处理这些点。
+         */
+        if (pMP->isBad())
+        {
+            continue;
+        }
+
+
+        const Eigen::Vector3f world_pos =
+            pMP->GetWorldPos();
+
+
+        if (
+            !std::isfinite(world_pos.x()) ||
+            !std::isfinite(world_pos.y()) ||
+            !std::isfinite(world_pos.z()))
+        {
+            continue;
+        }
+
+
+        MapPointSnapshot snapshot;
+
+
+        snapshot.id =
+            pMP->mnId;
+
+
+        snapshot.x =
+            world_pos.x();
+
+
+        snapshot.y =
+            world_pos.y();
+
+
+        snapshot.z =
+            world_pos.z();
+
+
+        snapshots.push_back(
+            snapshot);
+    }
+
+
+    if (snapshots.empty())
+    {
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 当前Batch
+     * ==========================================================
+     */
+
+    std::vector<MapPointBatchData> batch;
+
+
+    batch.reserve(
+        kMapPointsPerBatch);
+
+
+    /*
+     * 当前还有多少新点等待ADD。
+     */
+    std::size_t new_pending_count =
+        0;
+
+
+    /*
+     * 当前有多少旧点达到UPDATE阈值。
+     */
+    std::size_t update_pending_count =
+        0;
+
+
+    /*
+     * 当前Batch选择的UPDATE数量。
+     */
+    std::size_t selected_update_count =
+        0;
+
+
+    /*
+     * 2cm阈值平方。
+     *
+     * 比较时先不sqrt，
+     * 降低不必要计算。
+     */
+    const float update_threshold_squared =
+        kMapPointUpdateThresholdMeters *
+        kMapPointUpdateThresholdMeters;
+
+
+    /*
+     * ==========================================================
+     * 第一遍：
+     *
+     * 搜索UPDATE
+     * ==========================================================
+     *
+     * 每批最多先选择10个UPDATE。
+     */
+
+    for (
+        const MapPointSnapshot& snapshot :
+        snapshots)
+    {
+        const auto it =
+            last_sent_map_points_.find(
+                snapshot.id);
+
+
+        /*
+         * 从未同步：
+         *
+         * 第二遍作为ADD处理。
+         */
+        if (
+            it ==
+            last_sent_map_points_.end())
+        {
+            ++new_pending_count;
+
+            continue;
+        }
+
+
+        /*
+         * 当前坐标 - 上次发送坐标。
+         */
+        const float dx =
+            snapshot.x -
+            it->second.x;
+
+
+        const float dy =
+            snapshot.y -
+            it->second.y;
+
+
+        const float dz =
+            snapshot.z -
+            it->second.z;
+
+
+        const float distance_squared =
+            dx * dx +
+            dy * dy +
+            dz * dz;
+
+
+        /*
+         * 小于2cm：
+         *
+         * 不发送。
+         */
+        if (
+            distance_squared <
+            update_threshold_squared)
+        {
+            continue;
+        }
+
+
+        /*
+         * 已达到UPDATE阈值。
+         */
+        ++update_pending_count;
+
+
+        /*
+         * 本Batch最多10个UPDATE。
+         */
+        if (
+            selected_update_count >=
+            kMaxUpdatesPerBatch)
+        {
+            continue;
+        }
+
+
+        if (
+            batch.size() >=
+            kMapPointsPerBatch)
+        {
+            continue;
+        }
+
+
+        MapPointBatchData point;
+
+
+        point.operation =
+            MapPointBatchOperation::UPDATE;
+
+
+        point.id =
+            snapshot.id;
+
+
+        /*
+         * 新XYZ。
+         */
+        point.x =
+            snapshot.x;
+
+
+        point.y =
+            snapshot.y;
+
+
+        point.z =
+            snapshot.z;
+
+
+        /*
+         * 上一次已同步XYZ。
+         */
+        point.previous_x =
+            it->second.x;
+
+
+        point.previous_y =
+            it->second.y;
+
+
+        point.previous_z =
+            it->second.z;
+
+
+        /*
+         * 实际位移。
+         */
+        point.delta =
+            std::sqrt(
+                distance_squared);
+
+
+        batch.push_back(
+            point);
+
+
+        ++selected_update_count;
+    }
+
+
+    /*
+     * ==========================================================
+     * 第二遍：
+     *
+     * ADD填充剩余Batch
+     * ==========================================================
+     */
+
+    for (
+        const MapPointSnapshot& snapshot :
+        snapshots)
+    {
+        /*
+         * 达到20条。
+         */
+        if (
+            batch.size() >=
+            kMapPointsPerBatch)
+        {
+            break;
+        }
+
+
+        /*
+         * 已经同步过。
+         *
+         * 不能再次ADD。
+         */
+        if (
+            last_sent_map_points_.find(
+                snapshot.id) !=
+            last_sent_map_points_.end())
+        {
+            continue;
+        }
+
+
+        MapPointBatchData point;
+
+
+        point.operation =
+            MapPointBatchOperation::ADD;
+
+
+        point.id =
+            snapshot.id;
+
+
+        point.x =
+            snapshot.x;
+
+
+        point.y =
+            snapshot.y;
+
+
+        point.z =
+            snapshot.z;
+
+
+        /*
+         * ADD没有previous。
+         *
+         * 暂时赋值为当前坐标，
+         * 防止未初始化数据。
+         */
+        point.previous_x =
+            snapshot.x;
+
+
+        point.previous_y =
+            snapshot.y;
+
+
+        point.previous_z =
+            snapshot.z;
+
+
+        point.delta =
+            0.0F;
+
+
+        batch.push_back(
+            point);
+    }
+
+
+    /*
+     * 当前没有需要同步的内容。
+     */
+    if (batch.empty())
+    {
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 当前V2模拟“发送成功”
+     * ==========================================================
+     *
+     * 后面加入UART / LoRa / ACK以后：
+     *
+     * 这里不能直接更新last_sent_map_points_。
+     *
+     * 必须：
+     *
+     * 发送Batch
+     *      ↓
+     * 收到ACK
+     *      ↓
+     * 再更新同步状态。
+     */
+
+    std::size_t batch_add_count =
+        0;
+
+
+    std::size_t batch_update_count =
+        0;
+
+
+    for (
+        const MapPointBatchData& point :
+        batch)
+    {
+        LastSentMapPointData state;
+
+
+        state.x =
+            point.x;
+
+
+        state.y =
+            point.y;
+
+
+        state.z =
+            point.z;
+
+
+        /*
+         * 当前阶段假设PC已经成功同步。
+         */
+        last_sent_map_points_[
+            point.id] =
+            state;
+
+
+        if (
+            point.operation ==
+            MapPointBatchOperation::ADD)
+        {
+            ++batch_add_count;
+
+            ++map_point_add_total_;
+        }
+        else
+        {
+            ++batch_update_count;
+
+            ++map_point_update_total_;
+        }
+    }
+
+
+    /*
+     * ==========================================================
+     * Batch统计
+     * ==========================================================
+     */
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "[MapBatchV2] "
+        "valid=%zu "
+        "new_pending=%zu "
+        "update_pending=%zu "
+        "batch=%zu "
+        "add=%zu "
+        "update=%zu "
+        "synced_total=%zu "
+        "add_total=%zu "
+        "update_total=%zu",
+        snapshots.size(),
+        new_pending_count,
+        update_pending_count,
+        batch.size(),
+        batch_add_count,
+        batch_update_count,
+        last_sent_map_points_.size(),
+        map_point_add_total_,
+        map_point_update_total_);
+
+
+    /*
+     * ==========================================================
+     * 打印Batch
+     * ==========================================================
+     */
+
+    for (
+        const MapPointBatchData& point :
+        batch)
+    {
+        /*
+         * ADD
+         */
+        if (
+            point.operation ==
+            MapPointBatchOperation::ADD)
+        {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "  ADD id=%lu "
+                "xyz=(%.3f, %.3f, %.3f)",
+                point.id,
+                point.x,
+                point.y,
+                point.z);
+        }
+
+        /*
+         * UPDATE
+         */
+        else
+        {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "  UPDATE id=%lu "
+                "old=(%.3f, %.3f, %.3f) "
+                "new=(%.3f, %.3f, %.3f) "
+                "delta=%.3f m",
+                point.id,
+                point.previous_x,
+                point.previous_y,
+                point.previous_z,
+                point.x,
+                point.y,
+                point.z,
+                point.delta);
+        }
+    }
+}
+
+
+
+void StereoSlamNode::PublishSlamOutputs(
+    const Sophus::SE3f& Tcw,
+    const std_msgs::msg::Header& imageHeader)
+{
+    /*
+     * ==========================================================
+     * Tracking State
+     * ==========================================================
+     */
+
+    const int tracking_state =
+        m_SLAM->GetTrackingState();
+
+
+    std_msgs::msg::Int32 state_msg;
+
+
+    state_msg.data =
+        tracking_state;
+
+
+    tracking_state_pub_->publish(
+        state_msg);
+
+
+    /*
+     * 状态变化时打印。
+     */
+    if (
+        tracking_state !=
+        last_tracking_state_)
+    {
+        RCLCPP_INFO(
+            this->get_logger(),
+            "ORB-SLAM3 tracking state: %d (%s)",
+            tracking_state,
+            TrackingStateName(
+                tracking_state));
+
+
+        last_tracking_state_ =
+            tracking_state;
+    }
+
+
+    /*
+     * 只在OK状态输出有效数据。
+     */
+    if (
+        tracking_state !=
+        ORB_SLAM3::Tracking::OK)
+    {
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * Tcw -> Twc
+     * ==========================================================
+     */
+
+    const Sophus::SE3f Twc =
+        Tcw.inverse();
+
+
+    const Eigen::Vector3f translation =
+        Twc.translation();
+
+
+    Eigen::Quaternionf quaternion =
+        Twc.unit_quaternion();
+
+
+    quaternion.normalize();
+
+
+    /*
+     * ==========================================================
+     * Pose合法性
+     * ==========================================================
+     */
+
+    const bool pose_is_finite =
+        std::isfinite(
+            translation.x()) &&
+        std::isfinite(
+            translation.y()) &&
+        std::isfinite(
+            translation.z()) &&
+        std::isfinite(
+            quaternion.x()) &&
+        std::isfinite(
+            quaternion.y()) &&
+        std::isfinite(
+            quaternion.z()) &&
+        std::isfinite(
+            quaternion.w());
+
+
+    if (!pose_is_finite)
+    {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "ORB-SLAM3 returned a "
+            "non-finite pose");
+
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * PoseStamped
+     * ==========================================================
+     */
+
+    geometry_msgs::msg::PoseStamped pose_msg;
+
+
+    pose_msg.header.stamp =
+        imageHeader.stamp;
+
+
+    pose_msg.header.frame_id =
+        kOrbMapFrame;
+
+
+    pose_msg.pose.position.x =
+        static_cast<double>(
+            translation.x());
+
+
+    pose_msg.pose.position.y =
+        static_cast<double>(
+            translation.y());
+
+
+    pose_msg.pose.position.z =
+        static_cast<double>(
+            translation.z());
+
+
+    pose_msg.pose.orientation.x =
+        static_cast<double>(
+            quaternion.x());
+
+
+    pose_msg.pose.orientation.y =
+        static_cast<double>(
+            quaternion.y());
+
+
+    pose_msg.pose.orientation.z =
+        static_cast<double>(
+            quaternion.z());
+
+
+    pose_msg.pose.orientation.w =
+        static_cast<double>(
+            quaternion.w());
+
+
+    /*
+     * 发布Pose。
+     */
+    pose_pub_->publish(
+        pose_msg);
+
+
+    has_valid_pose_ =
+        true;
+
+
+    /*
+     * ==========================================================
+     * RViz MapPoints
+     * ==========================================================
+     */
+
+    ++map_points_decimation_counter_;
+
+
+    if (
+        (
+            map_points_decimation_counter_
+            %
+            kMapPointsPublishStride
+        )
+        ==
+        0)
+    {
+        PublishTrackedMapPoints(
+            imageHeader);
+    }
+
+
+    /*
+     * ==========================================================
+     * MapPoint通信Batch V2
+     * ==========================================================
+     *
+     * 当前：
+     *
+     * ADD + UPDATE
+     */
+
+    ++map_batch_decimation_counter_;
+
+
+    if (
+        (
+            map_batch_decimation_counter_
+            %
+            kMapBatchPublishStride
+        )
+        ==
+        0)
+    {
+        PrepareMapPointBatch();
+    }
+
+
+    /*
+     * ==========================================================
+     * Path
+     * ==========================================================
+     */
+
+    ++path_decimation_counter_;
+
+
+    if (
+        (
+            path_decimation_counter_
+            %
+            kPathPublishStride
+        )
+        !=
+        0)
+    {
+        return;
+    }
+
+
+    path_msg_.header.stamp =
+        imageHeader.stamp;
+
+
+    path_msg_.header.frame_id =
+        kOrbMapFrame;
+
+
+    path_msg_.poses.push_back(
+        pose_msg);
+
+
+    /*
+     * 防止Path无限增长。
+     */
+    if (
+        path_msg_.poses.size() >
+        kMaxPathPoses)
+    {
+        path_msg_.poses.erase(
+            path_msg_.poses.begin(),
+            path_msg_.poses.begin() +
+                500);
+    }
+
+
+    path_pub_->publish(
+        path_msg_);
+}

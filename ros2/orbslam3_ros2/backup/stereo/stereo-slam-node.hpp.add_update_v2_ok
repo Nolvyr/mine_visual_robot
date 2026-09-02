@@ -1,0 +1,344 @@
+#ifndef __STEREO_SLAM_NODE_HPP__
+#define __STEREO_SLAM_NODE_HPP__
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+#include "rclcpp/rclcpp.hpp"
+
+#include "sensor_msgs/msg/image.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+
+#include "geometry_msgs/msg/pose_stamped.hpp"
+
+#include "nav_msgs/msg/path.hpp"
+
+#include "std_msgs/msg/header.hpp"
+#include "std_msgs/msg/int32.hpp"
+
+#include "message_filters/subscriber.h"
+#include "message_filters/synchronizer.h"
+#include "message_filters/sync_policies/approximate_time.h"
+
+#include <cv_bridge/cv_bridge.h>
+
+#include "System.h"
+#include "Frame.h"
+#include "Map.h"
+#include "MapPoint.h"
+#include "Tracking.h"
+
+#include "utility.hpp"
+
+
+class StereoSlamNode : public rclcpp::Node
+{
+public:
+
+    StereoSlamNode(
+        ORB_SLAM3::System* pSLAM,
+        const std::string& strSettingsFile,
+        const std::string& strDoRectify);
+
+    ~StereoSlamNode() override;
+
+
+private:
+
+    using ImageMsg =
+        sensor_msgs::msg::Image;
+
+
+    using ApproximateSyncPolicy =
+        message_filters::sync_policies::ApproximateTime<
+            ImageMsg,
+            ImageMsg>;
+
+
+    /*
+     * 双目图像同步回调。
+     */
+    void GrabStereo(
+        const ImageMsg::ConstSharedPtr& msgLeft,
+        const ImageMsg::ConstSharedPtr& msgRight);
+
+
+    /*
+     * 发布：
+     *
+     * 1. Tracking State
+     * 2. Pose
+     * 3. Path
+     * 4. MapPoints
+     * 5. MapPoint通信Batch
+     */
+    void PublishSlamOutputs(
+        const Sophus::SE3f& Tcw,
+        const std_msgs::msg::Header& imageHeader);
+
+
+    /*
+     * 发布当前活动Map中的稀疏地图点。
+     *
+     * Topic：
+     *
+     * /orbslam3/map_points
+     *
+     * 用于ROS2 / RViz调试。
+     *
+     * 与UART / LoRa通信路径独立。
+     */
+    void PublishTrackedMapPoints(
+        const std_msgs::msg::Header& imageHeader);
+
+
+    /*
+     * ==========================================================
+     * MapPoint通信操作
+     * ==========================================================
+     *
+     * 当前V2：
+     *
+     * ADD
+     * UPDATE
+     *
+     * DELETE下一阶段加入。
+     */
+    enum class MapPointBatchOperation : std::uint8_t
+    {
+        ADD = 1,
+        UPDATE = 2
+    };
+
+
+    /*
+     * ==========================================================
+     * 一条通信MapPoint数据
+     * ==========================================================
+     */
+    struct MapPointBatchData
+    {
+        MapPointBatchOperation operation;
+
+        unsigned long id;
+
+        /*
+         * 当前最新XYZ。
+         */
+        float x;
+        float y;
+        float z;
+
+
+        /*
+         * 上一次已同步XYZ。
+         *
+         * 当前仅用于UPDATE调试打印。
+         */
+        float previous_x;
+        float previous_y;
+        float previous_z;
+
+
+        /*
+         * 新旧XYZ之间的三维距离。
+         */
+        float delta;
+    };
+
+
+    /*
+     * ==========================================================
+     * 已同步MapPoint状态
+     * ==========================================================
+     *
+     * last_sent_map_points_中保存：
+     *
+     * mnId -> 上一次发送成功的XYZ
+     */
+    struct LastSentMapPointData
+    {
+        float x;
+        float y;
+        float z;
+    };
+
+
+    /*
+     * 准备MapPoint增量通信Batch。
+     *
+     * 当前V2支持：
+     *
+     * 新mnId
+     *      -> ADD
+     *
+     * 已有mnId且XYZ明显变化
+     *      -> UPDATE
+     *
+     * 每批最多20条操作。
+     */
+    void PrepareMapPointBatch();
+
+
+    /*
+     * ORB-SLAM3系统实例。
+     */
+    ORB_SLAM3::System* m_SLAM{nullptr};
+
+
+    /*
+     * 是否由ROS节点进行双目图像矫正。
+     */
+    bool doRectify{false};
+
+
+    /*
+     * 双目矫正映射。
+     */
+    cv::Mat M1l;
+    cv::Mat M2l;
+
+    cv::Mat M1r;
+    cv::Mat M2r;
+
+
+    /*
+     * ROS Image -> OpenCV。
+     */
+    cv_bridge::CvImageConstPtr cv_ptrLeft;
+    cv_bridge::CvImageConstPtr cv_ptrRight;
+
+
+    /*
+     * 双目订阅。
+     */
+    std::shared_ptr<
+        message_filters::Subscriber<ImageMsg>>
+        left_sub;
+
+    std::shared_ptr<
+        message_filters::Subscriber<ImageMsg>>
+        right_sub;
+
+
+    /*
+     * ApproximateTime同步器。
+     */
+    std::shared_ptr<
+        message_filters::Synchronizer<
+            ApproximateSyncPolicy>>
+        syncApproximate;
+
+
+    /*
+     * Pose Publisher。
+     *
+     * /orbslam3/pose
+     */
+    rclcpp::Publisher<
+        geometry_msgs::msg::PoseStamped>::SharedPtr
+        pose_pub_;
+
+
+    /*
+     * Tracking State Publisher。
+     *
+     * /orbslam3/tracking_state
+     */
+    rclcpp::Publisher<
+        std_msgs::msg::Int32>::SharedPtr
+        tracking_state_pub_;
+
+
+    /*
+     * Path Publisher。
+     *
+     * /orbslam3/path
+     */
+    rclcpp::Publisher<
+        nav_msgs::msg::Path>::SharedPtr
+        path_pub_;
+
+
+    /*
+     * MapPoints Publisher。
+     *
+     * /orbslam3/map_points
+     */
+    rclcpp::Publisher<
+        sensor_msgs::msg::PointCloud2>::SharedPtr
+        map_points_pub_;
+
+
+    /*
+     * 在线轨迹。
+     */
+    nav_msgs::msg::Path path_msg_;
+
+
+    /*
+     * Path降频计数器。
+     */
+    std::uint32_t path_decimation_counter_{0};
+
+
+    /*
+     * RViz MapPoints降频计数器。
+     */
+    std::uint32_t map_points_decimation_counter_{0};
+
+
+    /*
+     * 通信MapPoint Batch独立降频计数器。
+     */
+    std::uint32_t map_batch_decimation_counter_{0};
+
+
+    /*
+     * ==========================================================
+     * MapPoint同步状态缓存
+     * ==========================================================
+     *
+     * key：
+     *
+     * MapPoint::mnId
+     *
+     * value：
+     *
+     * PC上一次被认为已经同步的XYZ。
+     */
+    std::unordered_map<
+        unsigned long,
+        LastSentMapPointData>
+        last_sent_map_points_;
+
+
+    /*
+     * 当前SLAM运行期间累计ADD数量。
+     */
+    std::size_t map_point_add_total_{0};
+
+
+    /*
+     * 当前SLAM运行期间累计UPDATE数量。
+     */
+    std::size_t map_point_update_total_{0};
+
+
+    /*
+     * 只在Tracking状态变化时打印。
+     */
+    int last_tracking_state_{-999};
+
+
+    /*
+     * 是否已经产生有效轨迹。
+     */
+    bool has_valid_pose_{false};
+};
+
+
+#endif

@@ -1,0 +1,1948 @@
+#include "stereo-slam-node.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <unordered_set>
+#include <vector>
+
+#include <Eigen/Geometry>
+
+#include <opencv2/core/core.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgproc.hpp>
+
+#include "sensor_msgs/point_cloud2_iterator.hpp"
+
+
+using std::placeholders::_1;
+using std::placeholders::_2;
+
+
+namespace
+{
+
+constexpr const char* kOrbMapFrame =
+    "orb_map";
+
+
+constexpr std::uint32_t kPathPublishStride =
+    3;
+
+
+constexpr std::size_t kMaxPathPoses =
+    2000;
+
+
+constexpr std::uint32_t kMapPointsPublishStride =
+    15;
+
+
+constexpr std::size_t kMaxPublishedMapPoints =
+    300;
+
+
+/*
+ * ==========================================================
+ * Batch参数
+ * ==========================================================
+ */
+
+constexpr std::size_t kMapPointsPerBatch =
+    20;
+
+
+constexpr std::size_t kPreferredDeletesPerBatch =
+    8;
+
+
+constexpr std::size_t kPreferredUpdatesPerBatch =
+    6;
+
+
+constexpr std::uint32_t kMapBatchPublishStride =
+    15;
+
+
+/*
+ * ==========================================================
+ * V4通信量化
+ * ==========================================================
+ *
+ * 1米 = 100厘米。
+ */
+constexpr float kCoordinateScaleCm =
+    100.0F;
+
+
+/*
+ * UPDATE最小位移：
+ *
+ * 2cm
+ */
+constexpr std::int32_t kMapPointUpdateThresholdCm =
+    2;
+
+
+constexpr std::int32_t kMapPointUpdateThresholdSquaredCm =
+    kMapPointUpdateThresholdCm *
+    kMapPointUpdateThresholdCm;
+
+
+/*
+ * 连续两个Batch不存在才DELETE。
+ */
+constexpr std::uint8_t kDeleteMissingBatchThreshold =
+    2;
+
+
+/*
+ * ==========================================================
+ * 当前通信数据量估算
+ * ==========================================================
+ *
+ * ADD / UPDATE：
+ *
+ * Operation  1
+ * ID         4
+ * X          2
+ * Y          2
+ * Z          2
+ *
+ * = 11 Byte
+ */
+constexpr std::size_t kAddUpdateWireBytes =
+    11;
+
+
+/*
+ * DELETE：
+ *
+ * Operation  1
+ * ID         4
+ *
+ * = 5 Byte
+ */
+constexpr std::size_t kDeleteWireBytes =
+    5;
+
+
+/*
+ * ==========================================================
+ * float米 -> int16厘米
+ * ==========================================================
+ */
+bool QuantizeCoordinateCm(
+    const float meters,
+    std::int16_t& value_cm)
+{
+    if (!std::isfinite(meters))
+    {
+        return false;
+    }
+
+
+    const double scaled =
+        static_cast<double>(meters) *
+        static_cast<double>(
+            kCoordinateScaleCm);
+
+
+    /*
+     * 必须在round之前预留0.5，
+     * 防止32767.4 round后越界。
+     */
+    const double rounded =
+        std::round(
+            scaled);
+
+
+    const double min_value =
+        static_cast<double>(
+            std::numeric_limits<
+                std::int16_t>::min());
+
+
+    const double max_value =
+        static_cast<double>(
+            std::numeric_limits<
+                std::int16_t>::max());
+
+
+    if (
+        rounded < min_value ||
+        rounded > max_value)
+    {
+        return false;
+    }
+
+
+    value_cm =
+        static_cast<std::int16_t>(
+            rounded);
+
+
+    return true;
+}
+
+
+/*
+ * ==========================================================
+ * uint32通信ID
+ * ==========================================================
+ */
+bool ConvertMapPointIdToWire(
+    const unsigned long id,
+    std::uint32_t& wire_id)
+{
+    const unsigned long max_wire_id =
+        static_cast<unsigned long>(
+            std::numeric_limits<
+                std::uint32_t>::max());
+
+
+    if (id > max_wire_id)
+    {
+        return false;
+    }
+
+
+    wire_id =
+        static_cast<std::uint32_t>(
+            id);
+
+
+    return true;
+}
+
+
+
+const char* TrackingStateName(
+    const int state)
+{
+    switch (state)
+    {
+        case -1:
+            return "SYSTEM_NOT_READY";
+
+        case 0:
+            return "NO_IMAGES_YET";
+
+        case 1:
+            return "NOT_INITIALIZED";
+
+        case 2:
+            return "OK";
+
+        case 3:
+            return "RECENTLY_LOST";
+
+        case 4:
+            return "LOST";
+
+        case 5:
+            return "OK_KLT";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+} // namespace
+
+
+
+StereoSlamNode::StereoSlamNode(
+    ORB_SLAM3::System* pSLAM,
+    const std::string& strSettingsFile,
+    const std::string& strDoRectify)
+    :
+    Node("ORB_SLAM3_ROS2"),
+    m_SLAM(pSLAM)
+{
+    std::stringstream ss(
+        strDoRectify);
+
+
+    if (!(ss >> std::boolalpha >> doRectify))
+    {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Invalid rectify option '%s', using false",
+            strDoRectify.c_str());
+
+        doRectify = false;
+    }
+
+
+    /*
+     * ==========================================================
+     * Stereo Rectification
+     * ==========================================================
+     */
+
+    if (doRectify)
+    {
+        cv::FileStorage fsSettings(
+            strSettingsFile,
+            cv::FileStorage::READ);
+
+
+        if (!fsSettings.isOpened())
+        {
+            throw std::runtime_error(
+                "Wrong path to ORB-SLAM3 settings file: " +
+                strSettingsFile);
+        }
+
+
+        cv::Mat K_l;
+        cv::Mat K_r;
+
+        cv::Mat P_l;
+        cv::Mat P_r;
+
+        cv::Mat R_l;
+        cv::Mat R_r;
+
+        cv::Mat D_l;
+        cv::Mat D_r;
+
+
+        fsSettings["LEFT.K"] >> K_l;
+        fsSettings["RIGHT.K"] >> K_r;
+
+        fsSettings["LEFT.P"] >> P_l;
+        fsSettings["RIGHT.P"] >> P_r;
+
+        fsSettings["LEFT.R"] >> R_l;
+        fsSettings["RIGHT.R"] >> R_r;
+
+        fsSettings["LEFT.D"] >> D_l;
+        fsSettings["RIGHT.D"] >> D_r;
+
+
+        const int rows_l =
+            static_cast<int>(
+                fsSettings["LEFT.height"]);
+
+
+        const int cols_l =
+            static_cast<int>(
+                fsSettings["LEFT.width"]);
+
+
+        const int rows_r =
+            static_cast<int>(
+                fsSettings["RIGHT.height"]);
+
+
+        const int cols_r =
+            static_cast<int>(
+                fsSettings["RIGHT.width"]);
+
+
+        if (
+            K_l.empty() ||
+            K_r.empty() ||
+            P_l.empty() ||
+            P_r.empty() ||
+            R_l.empty() ||
+            R_r.empty() ||
+            D_l.empty() ||
+            D_r.empty() ||
+            rows_l == 0 ||
+            rows_r == 0 ||
+            cols_l == 0 ||
+            cols_r == 0)
+        {
+            throw std::runtime_error(
+                "Calibration parameters used to rectify "
+                "stereo images are missing");
+        }
+
+
+        cv::initUndistortRectifyMap(
+            K_l,
+            D_l,
+            R_l,
+            P_l.rowRange(0, 3).colRange(0, 3),
+            cv::Size(cols_l, rows_l),
+            CV_32F,
+            M1l,
+            M2l);
+
+
+        cv::initUndistortRectifyMap(
+            K_r,
+            D_r,
+            R_r,
+            P_r.rowRange(0, 3).colRange(0, 3),
+            cv::Size(cols_r, rows_r),
+            CV_32F,
+            M1r,
+            M2r);
+    }
+
+
+    /*
+     * ==========================================================
+     * Publishers
+     * ==========================================================
+     */
+
+    pose_pub_ =
+        this->create_publisher<
+            geometry_msgs::msg::PoseStamped>(
+                "/orbslam3/pose",
+                rclcpp::QoS(10));
+
+
+    tracking_state_pub_ =
+        this->create_publisher<
+            std_msgs::msg::Int32>(
+                "/orbslam3/tracking_state",
+                rclcpp::QoS(10));
+
+
+    path_pub_ =
+        this->create_publisher<
+            nav_msgs::msg::Path>(
+                "/orbslam3/path",
+                rclcpp::QoS(
+                    rclcpp::KeepLast(1))
+                    .reliable()
+                    .transient_local());
+
+
+    map_points_pub_ =
+        this->create_publisher<
+            sensor_msgs::msg::PointCloud2>(
+                "/orbslam3/map_points",
+                rclcpp::QoS(1));
+
+
+    path_msg_.header.frame_id =
+        kOrbMapFrame;
+
+
+    /*
+     * ==========================================================
+     * Subscribers
+     * ==========================================================
+     */
+
+    const auto image_qos =
+        rclcpp::SensorDataQoS()
+            .get_rmw_qos_profile();
+
+
+    left_sub =
+        std::make_shared<
+            message_filters::Subscriber<ImageMsg>>(
+                this,
+                "/left/image_rect",
+                image_qos);
+
+
+    right_sub =
+        std::make_shared<
+            message_filters::Subscriber<ImageMsg>>(
+                this,
+                "/right/image_rect",
+                image_qos);
+
+
+    syncApproximate =
+        std::make_shared<
+            message_filters::Synchronizer<
+                ApproximateSyncPolicy>>(
+                    ApproximateSyncPolicy(10),
+                    *left_sub,
+                    *right_sub);
+
+
+    syncApproximate->registerCallback(
+        std::bind(
+            &StereoSlamNode::GrabStereo,
+            this,
+            _1,
+            _2));
+
+
+    /*
+     * ==========================================================
+     * Startup Log
+     * ==========================================================
+     */
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Stereo SLAM publishers initialized");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Pose topic: /orbslam3/pose");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Tracking state topic: /orbslam3/tracking_state");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Path topic: /orbslam3/path");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Map points topic: /orbslam3/map_points");
+
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "MapPoint Batch V4 initialized: "
+        "max=%zu "
+        "coordinate=int16_cm "
+        "id=uint32 "
+        "cache=int16_xyz+uint8_missing "
+        "update_threshold=%dcm "
+        "delete_missing_batches=%u",
+        kMapPointsPerBatch,
+        kMapPointUpdateThresholdCm,
+        static_cast<unsigned int>(
+            kDeleteMissingBatchThreshold));
+}
+
+
+
+StereoSlamNode::~StereoSlamNode()
+{
+    if (m_SLAM == nullptr)
+    {
+        return;
+    }
+
+
+    m_SLAM->Shutdown();
+
+
+    if (has_valid_pose_)
+    {
+        m_SLAM->SaveTrajectoryTUM(
+            "CameraTrajectory.txt");
+
+
+        m_SLAM->SaveKeyFrameTrajectoryTUM(
+            "KeyFrameTrajectory.txt");
+
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Saved CameraTrajectory.txt and "
+            "KeyFrameTrajectory.txt");
+    }
+    else
+    {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "No valid SLAM pose was generated; "
+            "trajectory files were not saved");
+    }
+}
+
+
+
+void StereoSlamNode::GrabStereo(
+    const ImageMsg::ConstSharedPtr& msgLeft,
+    const ImageMsg::ConstSharedPtr& msgRight)
+{
+    try
+    {
+        cv_ptrLeft =
+            cv_bridge::toCvShare(
+                msgLeft);
+    }
+    catch (const cv_bridge::Exception& e)
+    {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Left image cv_bridge exception: %s",
+            e.what());
+
+        return;
+    }
+
+
+    try
+    {
+        cv_ptrRight =
+            cv_bridge::toCvShare(
+                msgRight);
+    }
+    catch (const cv_bridge::Exception& e)
+    {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Right image cv_bridge exception: %s",
+            e.what());
+
+        return;
+    }
+
+
+    const double timestamp =
+        Utility::StampToSec(
+            msgLeft->header.stamp);
+
+
+    Sophus::SE3f Tcw;
+
+
+    if (doRectify)
+    {
+        cv::Mat imLeft;
+        cv::Mat imRight;
+
+
+        cv::remap(
+            cv_ptrLeft->image,
+            imLeft,
+            M1l,
+            M2l,
+            cv::INTER_LINEAR);
+
+
+        cv::remap(
+            cv_ptrRight->image,
+            imRight,
+            M1r,
+            M2r,
+            cv::INTER_LINEAR);
+
+
+        Tcw =
+            m_SLAM->TrackStereo(
+                imLeft,
+                imRight,
+                timestamp);
+    }
+    else
+    {
+        Tcw =
+            m_SLAM->TrackStereo(
+                cv_ptrLeft->image,
+                cv_ptrRight->image,
+                timestamp);
+    }
+
+
+    PublishSlamOutputs(
+        Tcw,
+        msgLeft->header);
+}
+
+
+
+void StereoSlamNode::PublishTrackedMapPoints(
+    const std_msgs::msg::Header& imageHeader)
+{
+    const std::vector<ORB_SLAM3::MapPoint*> map_points =
+        m_SLAM->GetAllMapPoints();
+
+
+    if (map_points.empty())
+    {
+        return;
+    }
+
+
+    const std::size_t sampling_stride =
+        std::max<std::size_t>(
+            1,
+            (
+                map_points.size() +
+                kMaxPublishedMapPoints -
+                1
+            ) /
+            kMaxPublishedMapPoints);
+
+
+    std::vector<Eigen::Vector3f>
+        valid_points;
+
+
+    valid_points.reserve(
+        std::min(
+            map_points.size(),
+            kMaxPublishedMapPoints));
+
+
+    for (
+        std::size_t i = 0;
+        i < map_points.size();
+        i += sampling_stride)
+    {
+        ORB_SLAM3::MapPoint* pMP =
+            map_points[i];
+
+
+        if (pMP == nullptr)
+        {
+            continue;
+        }
+
+
+        if (pMP->isBad())
+        {
+            continue;
+        }
+
+
+        const Eigen::Vector3f world_pos =
+            pMP->GetWorldPos();
+
+
+        if (
+            !std::isfinite(world_pos.x()) ||
+            !std::isfinite(world_pos.y()) ||
+            !std::isfinite(world_pos.z()))
+        {
+            continue;
+        }
+
+
+        valid_points.push_back(
+            world_pos);
+
+
+        if (
+            valid_points.size() >=
+            kMaxPublishedMapPoints)
+        {
+            break;
+        }
+    }
+
+
+    if (valid_points.empty())
+    {
+        return;
+    }
+
+
+    sensor_msgs::msg::PointCloud2 cloud_msg;
+
+
+    cloud_msg.header.stamp =
+        imageHeader.stamp;
+
+
+    cloud_msg.header.frame_id =
+        kOrbMapFrame;
+
+
+    cloud_msg.height =
+        1;
+
+
+    sensor_msgs::PointCloud2Modifier modifier(
+        cloud_msg);
+
+
+    modifier.setPointCloud2FieldsByString(
+        1,
+        "xyz");
+
+
+    modifier.resize(
+        valid_points.size());
+
+
+    sensor_msgs::PointCloud2Iterator<float>
+        iter_x(
+            cloud_msg,
+            "x");
+
+
+    sensor_msgs::PointCloud2Iterator<float>
+        iter_y(
+            cloud_msg,
+            "y");
+
+
+    sensor_msgs::PointCloud2Iterator<float>
+        iter_z(
+            cloud_msg,
+            "z");
+
+
+    for (
+        const Eigen::Vector3f& point :
+        valid_points)
+    {
+        *iter_x =
+            point.x();
+
+        *iter_y =
+            point.y();
+
+        *iter_z =
+            point.z();
+
+
+        ++iter_x;
+        ++iter_y;
+        ++iter_z;
+    }
+
+
+    cloud_msg.is_dense =
+        true;
+
+
+    map_points_pub_->publish(
+        cloud_msg);
+}
+
+
+
+void StereoSlamNode::PrepareMapPointBatch()
+{
+    const std::vector<ORB_SLAM3::MapPoint*> map_points =
+        m_SLAM->GetAllMapPoints();
+
+
+    /*
+     * ==========================================================
+     * 当前地图通信快照
+     * ==========================================================
+     */
+    struct MapPointSnapshot
+    {
+        std::uint32_t id;
+
+
+        float raw_x;
+        float raw_y;
+        float raw_z;
+
+
+        std::int16_t x_cm;
+        std::int16_t y_cm;
+        std::int16_t z_cm;
+    };
+
+
+    std::vector<MapPointSnapshot>
+        snapshots;
+
+
+    snapshots.reserve(
+        map_points.size());
+
+
+    std::unordered_set<std::uint32_t>
+        current_ids;
+
+
+    current_ids.reserve(
+        map_points.size());
+
+
+    std::size_t orb_valid_count =
+        0;
+
+
+    std::size_t rejected_count =
+        0;
+
+
+    /*
+     * ==========================================================
+     * ORB float MapPoint
+     *          ↓
+     * uint32 ID + int16 cm
+     * ==========================================================
+     */
+
+    for (
+        ORB_SLAM3::MapPoint* pMP :
+        map_points)
+    {
+        if (pMP == nullptr)
+        {
+            continue;
+        }
+
+
+        if (pMP->isBad())
+        {
+            continue;
+        }
+
+
+        const Eigen::Vector3f world_pos =
+            pMP->GetWorldPos();
+
+
+        if (
+            !std::isfinite(world_pos.x()) ||
+            !std::isfinite(world_pos.y()) ||
+            !std::isfinite(world_pos.z()))
+        {
+            continue;
+        }
+
+
+        ++orb_valid_count;
+
+
+        std::uint32_t wire_id =
+            0;
+
+
+        if (
+            !ConvertMapPointIdToWire(
+                pMP->mnId,
+                wire_id))
+        {
+            ++rejected_count;
+
+            continue;
+        }
+
+
+        std::int16_t x_cm =
+            0;
+
+        std::int16_t y_cm =
+            0;
+
+        std::int16_t z_cm =
+            0;
+
+
+        if (
+            !QuantizeCoordinateCm(
+                world_pos.x(),
+                x_cm) ||
+            !QuantizeCoordinateCm(
+                world_pos.y(),
+                y_cm) ||
+            !QuantizeCoordinateCm(
+                world_pos.z(),
+                z_cm))
+        {
+            ++rejected_count;
+
+            continue;
+        }
+
+
+        MapPointSnapshot snapshot;
+
+
+        snapshot.id =
+            wire_id;
+
+
+        snapshot.raw_x =
+            world_pos.x();
+
+        snapshot.raw_y =
+            world_pos.y();
+
+        snapshot.raw_z =
+            world_pos.z();
+
+
+        snapshot.x_cm =
+            x_cm;
+
+        snapshot.y_cm =
+            y_cm;
+
+        snapshot.z_cm =
+            z_cm;
+
+
+        snapshots.push_back(
+            snapshot);
+
+
+        current_ids.insert(
+            wire_id);
+    }
+
+
+    /*
+     * ==========================================================
+     * Candidate containers
+     * ==========================================================
+     */
+
+    std::vector<MapPointBatchData>
+        delete_candidates;
+
+
+    std::vector<MapPointBatchData>
+        update_candidates;
+
+
+    std::vector<MapPointBatchData>
+        add_candidates;
+
+
+    /*
+     * ==========================================================
+     * DELETE判断
+     * ==========================================================
+     */
+
+    for (
+        auto& entry :
+        synced_map_points_)
+    {
+        const std::uint32_t id =
+            entry.first;
+
+
+        SyncedMapPointState& state =
+            entry.second;
+
+
+        if (
+            current_ids.find(id) !=
+            current_ids.end())
+        {
+            state.missing_count =
+                0;
+
+            continue;
+        }
+
+
+        if (
+            state.missing_count <
+            std::numeric_limits<
+                std::uint8_t>::max())
+        {
+            ++state.missing_count;
+        }
+
+
+        if (
+            state.missing_count <
+            kDeleteMissingBatchThreshold)
+        {
+            continue;
+        }
+
+
+        MapPointBatchData point;
+
+
+        point.operation =
+            MapPointBatchOperation::DELETE;
+
+
+        point.id =
+            id;
+
+
+        point.raw_x =
+            0.0F;
+
+        point.raw_y =
+            0.0F;
+
+        point.raw_z =
+            0.0F;
+
+
+        point.x_cm =
+            0;
+
+        point.y_cm =
+            0;
+
+        point.z_cm =
+            0;
+
+
+        point.previous_x_cm =
+            state.x_cm;
+
+        point.previous_y_cm =
+            state.y_cm;
+
+        point.previous_z_cm =
+            state.z_cm;
+
+
+        point.delta_cm =
+            0.0F;
+
+
+        delete_candidates.push_back(
+            point);
+    }
+
+
+    /*
+     * ==========================================================
+     * ADD / UPDATE判断
+     * ==========================================================
+     */
+
+    for (
+        const MapPointSnapshot& snapshot :
+        snapshots)
+    {
+        const auto it =
+            synced_map_points_.find(
+                snapshot.id);
+
+
+        /*
+         * ======================================================
+         * ADD
+         * ======================================================
+         */
+        if (
+            it ==
+            synced_map_points_.end())
+        {
+            MapPointBatchData point;
+
+
+            point.operation =
+                MapPointBatchOperation::ADD;
+
+
+            point.id =
+                snapshot.id;
+
+
+            point.raw_x =
+                snapshot.raw_x;
+
+            point.raw_y =
+                snapshot.raw_y;
+
+            point.raw_z =
+                snapshot.raw_z;
+
+
+            point.x_cm =
+                snapshot.x_cm;
+
+            point.y_cm =
+                snapshot.y_cm;
+
+            point.z_cm =
+                snapshot.z_cm;
+
+
+            point.previous_x_cm =
+                snapshot.x_cm;
+
+            point.previous_y_cm =
+                snapshot.y_cm;
+
+            point.previous_z_cm =
+                snapshot.z_cm;
+
+
+            point.delta_cm =
+                0.0F;
+
+
+            add_candidates.push_back(
+                point);
+
+
+            continue;
+        }
+
+
+        /*
+         * ======================================================
+         * UPDATE
+         * ======================================================
+         *
+         * 现在完全用通信整数坐标比较。
+         */
+
+        const std::int32_t dx_cm =
+            static_cast<std::int32_t>(
+                snapshot.x_cm)
+            -
+            static_cast<std::int32_t>(
+                it->second.x_cm);
+
+
+        const std::int32_t dy_cm =
+            static_cast<std::int32_t>(
+                snapshot.y_cm)
+            -
+            static_cast<std::int32_t>(
+                it->second.y_cm);
+
+
+        const std::int32_t dz_cm =
+            static_cast<std::int32_t>(
+                snapshot.z_cm)
+            -
+            static_cast<std::int32_t>(
+                it->second.z_cm);
+
+
+        const std::int32_t distance_squared_cm =
+            dx_cm * dx_cm +
+            dy_cm * dy_cm +
+            dz_cm * dz_cm;
+
+
+        if (
+            distance_squared_cm <
+            kMapPointUpdateThresholdSquaredCm)
+        {
+            continue;
+        }
+
+
+        MapPointBatchData point;
+
+
+        point.operation =
+            MapPointBatchOperation::UPDATE;
+
+
+        point.id =
+            snapshot.id;
+
+
+        point.raw_x =
+            snapshot.raw_x;
+
+        point.raw_y =
+            snapshot.raw_y;
+
+        point.raw_z =
+            snapshot.raw_z;
+
+
+        point.x_cm =
+            snapshot.x_cm;
+
+        point.y_cm =
+            snapshot.y_cm;
+
+        point.z_cm =
+            snapshot.z_cm;
+
+
+        point.previous_x_cm =
+            it->second.x_cm;
+
+        point.previous_y_cm =
+            it->second.y_cm;
+
+        point.previous_z_cm =
+            it->second.z_cm;
+
+
+        point.delta_cm =
+            std::sqrt(
+                static_cast<float>(
+                    distance_squared_cm));
+
+
+        update_candidates.push_back(
+            point);
+    }
+
+
+    /*
+     * 完全没有增量。
+     */
+    if (
+        delete_candidates.empty() &&
+        update_candidates.empty() &&
+        add_candidates.empty())
+    {
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 构造最多20条Batch
+     * ==========================================================
+     */
+
+    std::vector<MapPointBatchData>
+        batch;
+
+
+    batch.reserve(
+        kMapPointsPerBatch);
+
+
+    std::size_t delete_index =
+        0;
+
+
+    std::size_t update_index =
+        0;
+
+
+    std::size_t add_index =
+        0;
+
+
+    /*
+     * 第一轮：
+     * 最多8 DELETE
+     */
+    while (
+        delete_index <
+            delete_candidates.size() &&
+        delete_index <
+            kPreferredDeletesPerBatch &&
+        batch.size() <
+            kMapPointsPerBatch)
+    {
+        batch.push_back(
+            delete_candidates[
+                delete_index]);
+
+
+        ++delete_index;
+    }
+
+
+    /*
+     * 第二轮：
+     * 最多6 UPDATE
+     */
+    while (
+        update_index <
+            update_candidates.size() &&
+        update_index <
+            kPreferredUpdatesPerBatch &&
+        batch.size() <
+            kMapPointsPerBatch)
+    {
+        batch.push_back(
+            update_candidates[
+                update_index]);
+
+
+        ++update_index;
+    }
+
+
+    /*
+     * 第三轮：
+     * ADD填满剩余空间
+     */
+    while (
+        add_index <
+            add_candidates.size() &&
+        batch.size() <
+            kMapPointsPerBatch)
+    {
+        batch.push_back(
+            add_candidates[
+                add_index]);
+
+
+        ++add_index;
+    }
+
+
+    /*
+     * ADD不足时继续补DELETE。
+     */
+    while (
+        delete_index <
+            delete_candidates.size() &&
+        batch.size() <
+            kMapPointsPerBatch)
+    {
+        batch.push_back(
+            delete_candidates[
+                delete_index]);
+
+
+        ++delete_index;
+    }
+
+
+    /*
+     * 最后继续补UPDATE。
+     */
+    while (
+        update_index <
+            update_candidates.size() &&
+        batch.size() <
+            kMapPointsPerBatch)
+    {
+        batch.push_back(
+            update_candidates[
+                update_index]);
+
+
+        ++update_index;
+    }
+
+
+    if (batch.empty())
+    {
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * V4测试阶段：
+     *
+     * 暂时假定Batch已经成功到达PC。
+     *
+     * 真正UART阶段将改为：
+     *
+     * send
+     * ↓
+     * waiting ACK
+     * ↓
+     * ACK
+     * ↓
+     * 更新synced_map_points_
+     * ==========================================================
+     */
+
+    std::size_t batch_add_count =
+        0;
+
+
+    std::size_t batch_update_count =
+        0;
+
+
+    std::size_t batch_delete_count =
+        0;
+
+
+    std::size_t estimated_payload_bytes =
+        0;
+
+
+    for (
+        const MapPointBatchData& point :
+        batch)
+    {
+        if (
+            point.operation ==
+            MapPointBatchOperation::ADD)
+        {
+            SyncedMapPointState state;
+
+
+            state.x_cm =
+                point.x_cm;
+
+            state.y_cm =
+                point.y_cm;
+
+            state.z_cm =
+                point.z_cm;
+
+            state.missing_count =
+                0;
+
+
+            synced_map_points_[
+                point.id] =
+                state;
+
+
+            ++batch_add_count;
+
+            ++map_point_add_total_;
+
+
+            estimated_payload_bytes +=
+                kAddUpdateWireBytes;
+        }
+
+
+        else if (
+            point.operation ==
+            MapPointBatchOperation::UPDATE)
+        {
+            auto it =
+                synced_map_points_.find(
+                    point.id);
+
+
+            if (
+                it !=
+                synced_map_points_.end())
+            {
+                it->second.x_cm =
+                    point.x_cm;
+
+                it->second.y_cm =
+                    point.y_cm;
+
+                it->second.z_cm =
+                    point.z_cm;
+
+                it->second.missing_count =
+                    0;
+            }
+
+
+            ++batch_update_count;
+
+            ++map_point_update_total_;
+
+
+            estimated_payload_bytes +=
+                kAddUpdateWireBytes;
+        }
+
+
+        else
+        {
+            synced_map_points_.erase(
+                point.id);
+
+
+            ++batch_delete_count;
+
+            ++map_point_delete_total_;
+
+
+            estimated_payload_bytes +=
+                kDeleteWireBytes;
+        }
+    }
+
+
+    /*
+     * ==========================================================
+     * Batch统计
+     * ==========================================================
+     */
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "[MapBatchV4] "
+        "orb_valid=%zu "
+        "comm_valid=%zu "
+        "rejected=%zu "
+        "add_pending=%zu "
+        "update_pending=%zu "
+        "delete_pending=%zu "
+        "batch=%zu "
+        "add=%zu "
+        "update=%zu "
+        "delete=%zu "
+        "synced_now=%zu "
+        "estimated_payload=%zuB "
+        "add_total=%zu "
+        "update_total=%zu "
+        "delete_total=%zu",
+        orb_valid_count,
+        snapshots.size(),
+        rejected_count,
+        add_candidates.size(),
+        update_candidates.size(),
+        delete_candidates.size(),
+        batch.size(),
+        batch_add_count,
+        batch_update_count,
+        batch_delete_count,
+        synced_map_points_.size(),
+        estimated_payload_bytes,
+        map_point_add_total_,
+        map_point_update_total_,
+        map_point_delete_total_);
+
+
+    /*
+     * ==========================================================
+     * 每条操作日志
+     * ==========================================================
+     */
+
+    for (
+        const MapPointBatchData& point :
+        batch)
+    {
+        if (
+            point.operation ==
+            MapPointBatchOperation::ADD)
+        {
+            const float restored_x =
+                static_cast<float>(
+                    point.x_cm) /
+                100.0F;
+
+
+            const float restored_y =
+                static_cast<float>(
+                    point.y_cm) /
+                100.0F;
+
+
+            const float restored_z =
+                static_cast<float>(
+                    point.z_cm) /
+                100.0F;
+
+
+            const float max_error_cm =
+                std::max(
+                    {
+                        std::fabs(
+                            point.raw_x -
+                            restored_x),
+
+                        std::fabs(
+                            point.raw_y -
+                            restored_y),
+
+                        std::fabs(
+                            point.raw_z -
+                            restored_z)
+                    })
+                *
+                100.0F;
+
+
+            RCLCPP_INFO(
+                this->get_logger(),
+                "  ADD "
+                "id=%u "
+                "raw=(%.3f, %.3f, %.3f)m "
+                "cm=(%d, %d, %d) "
+                "restored=(%.3f, %.3f, %.3f)m "
+                "max_err=%.3fcm",
+                static_cast<unsigned int>(
+                    point.id),
+                point.raw_x,
+                point.raw_y,
+                point.raw_z,
+                static_cast<int>(
+                    point.x_cm),
+                static_cast<int>(
+                    point.y_cm),
+                static_cast<int>(
+                    point.z_cm),
+                restored_x,
+                restored_y,
+                restored_z,
+                max_error_cm);
+        }
+
+
+        else if (
+            point.operation ==
+            MapPointBatchOperation::UPDATE)
+        {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "  UPDATE "
+                "id=%u "
+                "old_cm=(%d, %d, %d) "
+                "new_cm=(%d, %d, %d) "
+                "delta=%.2fcm "
+                "raw=(%.3f, %.3f, %.3f)m",
+                static_cast<unsigned int>(
+                    point.id),
+                static_cast<int>(
+                    point.previous_x_cm),
+                static_cast<int>(
+                    point.previous_y_cm),
+                static_cast<int>(
+                    point.previous_z_cm),
+                static_cast<int>(
+                    point.x_cm),
+                static_cast<int>(
+                    point.y_cm),
+                static_cast<int>(
+                    point.z_cm),
+                point.delta_cm,
+                point.raw_x,
+                point.raw_y,
+                point.raw_z);
+        }
+
+
+        else
+        {
+            RCLCPP_INFO(
+                this->get_logger(),
+                "  DELETE "
+                "id=%u "
+                "last_cm=(%d, %d, %d) "
+                "wire_size=%zuB",
+                static_cast<unsigned int>(
+                    point.id),
+                static_cast<int>(
+                    point.previous_x_cm),
+                static_cast<int>(
+                    point.previous_y_cm),
+                static_cast<int>(
+                    point.previous_z_cm),
+                kDeleteWireBytes);
+        }
+    }
+}
+
+
+
+void StereoSlamNode::PublishSlamOutputs(
+    const Sophus::SE3f& Tcw,
+    const std_msgs::msg::Header& imageHeader)
+{
+    const int tracking_state =
+        m_SLAM->GetTrackingState();
+
+
+    std_msgs::msg::Int32 state_msg;
+
+
+    state_msg.data =
+        tracking_state;
+
+
+    tracking_state_pub_->publish(
+        state_msg);
+
+
+    if (
+        tracking_state !=
+        last_tracking_state_)
+    {
+        RCLCPP_INFO(
+            this->get_logger(),
+            "ORB-SLAM3 tracking state: %d (%s)",
+            tracking_state,
+            TrackingStateName(
+                tracking_state));
+
+
+        last_tracking_state_ =
+            tracking_state;
+    }
+
+
+    if (
+        tracking_state !=
+        ORB_SLAM3::Tracking::OK)
+    {
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * Pose
+     * ==========================================================
+     */
+
+    const Sophus::SE3f Twc =
+        Tcw.inverse();
+
+
+    const Eigen::Vector3f translation =
+        Twc.translation();
+
+
+    Eigen::Quaternionf quaternion =
+        Twc.unit_quaternion();
+
+
+    quaternion.normalize();
+
+
+    const bool pose_is_finite =
+        std::isfinite(
+            translation.x()) &&
+        std::isfinite(
+            translation.y()) &&
+        std::isfinite(
+            translation.z()) &&
+        std::isfinite(
+            quaternion.x()) &&
+        std::isfinite(
+            quaternion.y()) &&
+        std::isfinite(
+            quaternion.z()) &&
+        std::isfinite(
+            quaternion.w());
+
+
+    if (!pose_is_finite)
+    {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "ORB-SLAM3 returned a non-finite pose");
+
+        return;
+    }
+
+
+    geometry_msgs::msg::PoseStamped pose_msg;
+
+
+    pose_msg.header.stamp =
+        imageHeader.stamp;
+
+
+    pose_msg.header.frame_id =
+        kOrbMapFrame;
+
+
+    pose_msg.pose.position.x =
+        translation.x();
+
+
+    pose_msg.pose.position.y =
+        translation.y();
+
+
+    pose_msg.pose.position.z =
+        translation.z();
+
+
+    pose_msg.pose.orientation.x =
+        quaternion.x();
+
+
+    pose_msg.pose.orientation.y =
+        quaternion.y();
+
+
+    pose_msg.pose.orientation.z =
+        quaternion.z();
+
+
+    pose_msg.pose.orientation.w =
+        quaternion.w();
+
+
+    pose_pub_->publish(
+        pose_msg);
+
+
+    has_valid_pose_ =
+        true;
+
+
+    /*
+     * ==========================================================
+     * RViz MapPoint
+     * ==========================================================
+     */
+
+    ++map_points_decimation_counter_;
+
+
+    if (
+        (
+            map_points_decimation_counter_
+            %
+            kMapPointsPublishStride
+        )
+        ==
+        0)
+    {
+        PublishTrackedMapPoints(
+            imageHeader);
+    }
+
+
+    /*
+     * ==========================================================
+     * V4通信数据
+     * ==========================================================
+     */
+
+    ++map_batch_decimation_counter_;
+
+
+    if (
+        (
+            map_batch_decimation_counter_
+            %
+            kMapBatchPublishStride
+        )
+        ==
+        0)
+    {
+        PrepareMapPointBatch();
+    }
+
+
+    /*
+     * ==========================================================
+     * Path
+     * ==========================================================
+     */
+
+    ++path_decimation_counter_;
+
+
+    if (
+        (
+            path_decimation_counter_
+            %
+            kPathPublishStride
+        )
+        !=
+        0)
+    {
+        return;
+    }
+
+
+    path_msg_.header.stamp =
+        imageHeader.stamp;
+
+
+    path_msg_.header.frame_id =
+        kOrbMapFrame;
+
+
+    path_msg_.poses.push_back(
+        pose_msg);
+
+
+    if (
+        path_msg_.poses.size() >
+        kMaxPathPoses)
+    {
+        path_msg_.poses.erase(
+            path_msg_.poses.begin(),
+            path_msg_.poses.begin() +
+                500);
+    }
+
+
+    path_pub_->publish(
+        path_msg_);
+}

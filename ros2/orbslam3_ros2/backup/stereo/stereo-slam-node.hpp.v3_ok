@@ -1,0 +1,287 @@
+#ifndef __STEREO_SLAM_NODE_HPP__
+#define __STEREO_SLAM_NODE_HPP__
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+#include "rclcpp/rclcpp.hpp"
+
+#include "sensor_msgs/msg/image.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+
+#include "geometry_msgs/msg/pose_stamped.hpp"
+
+#include "nav_msgs/msg/path.hpp"
+
+#include "std_msgs/msg/header.hpp"
+#include "std_msgs/msg/int32.hpp"
+
+#include "message_filters/subscriber.h"
+#include "message_filters/synchronizer.h"
+#include "message_filters/sync_policies/approximate_time.h"
+
+#include <cv_bridge/cv_bridge.h>
+
+#include "System.h"
+#include "Frame.h"
+#include "Map.h"
+#include "MapPoint.h"
+#include "Tracking.h"
+
+#include "utility.hpp"
+
+
+class StereoSlamNode : public rclcpp::Node
+{
+public:
+
+    StereoSlamNode(
+        ORB_SLAM3::System* pSLAM,
+        const std::string& strSettingsFile,
+        const std::string& strDoRectify);
+
+    ~StereoSlamNode() override;
+
+
+private:
+
+    using ImageMsg =
+        sensor_msgs::msg::Image;
+
+
+    using ApproximateSyncPolicy =
+        message_filters::sync_policies::ApproximateTime<
+            ImageMsg,
+            ImageMsg>;
+
+
+    void GrabStereo(
+        const ImageMsg::ConstSharedPtr& msgLeft,
+        const ImageMsg::ConstSharedPtr& msgRight);
+
+
+    void PublishSlamOutputs(
+        const Sophus::SE3f& Tcw,
+        const std_msgs::msg::Header& imageHeader);
+
+
+    /*
+     * ROS2 / RViz地图点发布。
+     *
+     * 与通信Batch独立。
+     */
+    void PublishTrackedMapPoints(
+        const std_msgs::msg::Header& imageHeader);
+
+
+    /*
+     * ==========================================================
+     * MapPoint通信操作
+     * ==========================================================
+     */
+    enum class MapPointBatchOperation : std::uint8_t
+    {
+        ADD = 1,
+        UPDATE = 2,
+        DELETE = 3
+    };
+
+
+    /*
+     * 一条通信操作。
+     */
+    struct MapPointBatchData
+    {
+        MapPointBatchOperation operation;
+
+        unsigned long id;
+
+        /*
+         * ADD / UPDATE的新坐标。
+         *
+         * DELETE时不使用。
+         */
+        float x;
+        float y;
+        float z;
+
+
+        /*
+         * UPDATE调试使用：
+         *
+         * 上一次发送坐标。
+         */
+        float previous_x;
+        float previous_y;
+        float previous_z;
+
+
+        /*
+         * UPDATE位移。
+         */
+        float delta;
+    };
+
+
+    /*
+     * PC被认为已经具有的MapPoint状态。
+     */
+    struct LastSentMapPointData
+    {
+        float x;
+        float y;
+        float z;
+    };
+
+
+    /*
+     * 构造：
+     *
+     * ADD
+     * UPDATE
+     * DELETE
+     *
+     * 增量同步Batch。
+     */
+    void PrepareMapPointBatch();
+
+
+    /*
+     * ORB-SLAM3系统。
+     */
+    ORB_SLAM3::System* m_SLAM{nullptr};
+
+
+    /*
+     * 双目矫正。
+     */
+    bool doRectify{false};
+
+
+    cv::Mat M1l;
+    cv::Mat M2l;
+
+    cv::Mat M1r;
+    cv::Mat M2r;
+
+
+    cv_bridge::CvImageConstPtr cv_ptrLeft;
+    cv_bridge::CvImageConstPtr cv_ptrRight;
+
+
+    /*
+     * 双目Subscriber。
+     */
+    std::shared_ptr<
+        message_filters::Subscriber<ImageMsg>>
+        left_sub;
+
+    std::shared_ptr<
+        message_filters::Subscriber<ImageMsg>>
+        right_sub;
+
+
+    std::shared_ptr<
+        message_filters::Synchronizer<
+            ApproximateSyncPolicy>>
+        syncApproximate;
+
+
+    /*
+     * ROS2输出。
+     */
+    rclcpp::Publisher<
+        geometry_msgs::msg::PoseStamped>::SharedPtr
+        pose_pub_;
+
+
+    rclcpp::Publisher<
+        std_msgs::msg::Int32>::SharedPtr
+        tracking_state_pub_;
+
+
+    rclcpp::Publisher<
+        nav_msgs::msg::Path>::SharedPtr
+        path_pub_;
+
+
+    rclcpp::Publisher<
+        sensor_msgs::msg::PointCloud2>::SharedPtr
+        map_points_pub_;
+
+
+    nav_msgs::msg::Path path_msg_;
+
+
+    /*
+     * 各输出独立降频。
+     */
+    std::uint32_t path_decimation_counter_{0};
+
+    std::uint32_t map_points_decimation_counter_{0};
+
+    std::uint32_t map_batch_decimation_counter_{0};
+
+
+    /*
+     * ==========================================================
+     * PC当前被认为已经同步的地图
+     * ==========================================================
+     *
+     * mnId -> last sent XYZ
+     */
+    std::unordered_map<
+        unsigned long,
+        LastSentMapPointData>
+        last_sent_map_points_;
+
+
+    /*
+     * ==========================================================
+     * MapPoint连续缺失计数
+     * ==========================================================
+     *
+     * 某个已经同步的mnId：
+     *
+     * 本Batch找不到：
+     * missing_count + 1
+     *
+     * 再次出现：
+     * missing_count清零
+     *
+     * 连续缺失达到阈值：
+     * 生成DELETE
+     */
+    std::unordered_map<
+        unsigned long,
+        std::uint32_t>
+        map_point_missing_counts_;
+
+
+    /*
+     * 累计通信操作统计。
+     */
+    std::size_t map_point_add_total_{0};
+
+    std::size_t map_point_update_total_{0};
+
+    std::size_t map_point_delete_total_{0};
+
+
+    /*
+     * Tracking状态日志。
+     */
+    int last_tracking_state_{-999};
+
+
+    /*
+     * 是否产生过有效Pose。
+     */
+    bool has_valid_pose_{false};
+};
+
+
+#endif

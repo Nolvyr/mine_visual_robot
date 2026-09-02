@@ -1,0 +1,328 @@
+#ifndef __STEREO_SLAM_NODE_HPP__
+#define __STEREO_SLAM_NODE_HPP__
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <unordered_set>
+
+#include "rclcpp/rclcpp.hpp"
+
+#include "sensor_msgs/msg/image.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+
+#include "geometry_msgs/msg/pose_stamped.hpp"
+
+#include "nav_msgs/msg/path.hpp"
+
+#include "std_msgs/msg/header.hpp"
+#include "std_msgs/msg/int32.hpp"
+
+#include "message_filters/subscriber.h"
+#include "message_filters/synchronizer.h"
+#include "message_filters/sync_policies/approximate_time.h"
+
+#include <cv_bridge/cv_bridge.h>
+
+#include "System.h"
+#include "Frame.h"
+#include "Map.h"
+#include "MapPoint.h"
+#include "Tracking.h"
+
+#include "utility.hpp"
+
+
+class StereoSlamNode : public rclcpp::Node
+{
+public:
+
+    StereoSlamNode(
+        ORB_SLAM3::System* pSLAM,
+        const std::string& strSettingsFile,
+        const std::string& strDoRectify);
+
+    ~StereoSlamNode() override;
+
+
+private:
+
+    using ImageMsg =
+        sensor_msgs::msg::Image;
+
+
+    using ApproximateSyncPolicy =
+        message_filters::sync_policies::ApproximateTime<
+            ImageMsg,
+            ImageMsg>;
+
+
+    /*
+     * 双目图像同步回调函数。
+     *
+     * 使用ConstSharedPtr符合message_filters回调接口。
+     * 回调中只读取原始ROS消息。
+     */
+    void GrabStereo(
+        const ImageMsg::ConstSharedPtr& msgLeft,
+        const ImageMsg::ConstSharedPtr& msgRight);
+
+
+    /*
+     * 发布：
+     *
+     * 1. ORB-SLAM3跟踪状态
+     * 2. 当前相机位姿
+     * 3. 在线运动轨迹
+     * 4. 当前MapPoints
+     *
+     * ORB-SLAM3返回的Tcw表示：
+     *
+     * 世界坐标系 -> 相机坐标系
+     */
+    void PublishSlamOutputs(
+        const Sophus::SE3f& Tcw,
+        const std_msgs::msg::Header& imageHeader);
+
+
+    /*
+     * 发布ORB-SLAM3当前活动Map中的三维地图点。
+     *
+     * 当前使用：
+     *
+     * System::GetAllMapPoints()
+     *
+     * 输出：
+     *
+     * /orbslam3/map_points
+     *
+     * 类型：
+     *
+     * sensor_msgs/msg/PointCloud2
+     *
+     * 该路径主要用于ROS2 / RViz调试，
+     * 与后续UART/LoRa通信路径相互独立。
+     */
+    void PublishTrackedMapPoints(
+        const std_msgs::msg::Header& imageHeader);
+
+
+    /*
+     * ==========================================================
+     * MapPoint通信Batch数据
+     * ==========================================================
+     *
+     * 当前V1阶段只实现ADD。
+     *
+     * 一个通信MapPoint包含：
+     *
+     * mnId
+     * X
+     * Y
+     * Z
+     */
+    struct MapPointBatchData
+    {
+        unsigned long id;
+
+        float x;
+        float y;
+        float z;
+    };
+
+
+    /*
+     * 从ORB-SLAM3当前活动地图中查找：
+     *
+     * 第一次出现的新mnId
+     *
+     * 每次最多生成20个MapPoint。
+     *
+     * 当前只打印到终端，
+     * 暂时不进行UART / LoRa发送。
+     */
+    void PrepareMapPointBatch();
+
+
+    /*
+     * ORB-SLAM3系统实例。
+     *
+     * System对象实际在stereo.cpp中创建，
+     * 这里保存其指针。
+     */
+    ORB_SLAM3::System* m_SLAM{nullptr};
+
+
+    /*
+     * 是否在ROS节点内进行双目图像矫正。
+     */
+    bool doRectify{false};
+
+
+    /*
+     * 双目矫正映射表。
+     */
+    cv::Mat M1l;
+    cv::Mat M2l;
+
+    cv::Mat M1r;
+    cv::Mat M2r;
+
+
+    /*
+     * ROS Image -> OpenCV图像。
+     */
+    cv_bridge::CvImageConstPtr cv_ptrLeft;
+    cv_bridge::CvImageConstPtr cv_ptrRight;
+
+
+    /*
+     * 左右双目图像订阅器。
+     */
+    std::shared_ptr<
+        message_filters::Subscriber<ImageMsg>>
+        left_sub;
+
+    std::shared_ptr<
+        message_filters::Subscriber<ImageMsg>>
+        right_sub;
+
+
+    /*
+     * 左右图ApproximateTime同步器。
+     */
+    std::shared_ptr<
+        message_filters::Synchronizer<
+            ApproximateSyncPolicy>>
+        syncApproximate;
+
+
+    /*
+     * 当前相机位姿。
+     *
+     * Topic：
+     *
+     * /orbslam3/pose
+     */
+    rclcpp::Publisher<
+        geometry_msgs::msg::PoseStamped>::SharedPtr
+        pose_pub_;
+
+
+    /*
+     * 当前ORB-SLAM3跟踪状态。
+     *
+     * Topic：
+     *
+     * /orbslam3/tracking_state
+     */
+    rclcpp::Publisher<
+        std_msgs::msg::Int32>::SharedPtr
+        tracking_state_pub_;
+
+
+    /*
+     * 在线相机轨迹。
+     *
+     * Topic：
+     *
+     * /orbslam3/path
+     */
+    rclcpp::Publisher<
+        nav_msgs::msg::Path>::SharedPtr
+        path_pub_;
+
+
+    /*
+     * 当前ORB-SLAM3稀疏地图点。
+     *
+     * Topic：
+     *
+     * /orbslam3/map_points
+     */
+    rclcpp::Publisher<
+        sensor_msgs::msg::PointCloud2>::SharedPtr
+        map_points_pub_;
+
+
+    /*
+     * 在线轨迹消息。
+     */
+    nav_msgs::msg::Path path_msg_;
+
+
+    /*
+     * 不需要将30 FPS的每一帧位姿都加入Path。
+     *
+     * 使用计数器降低Path更新频率。
+     */
+    std::uint32_t path_decimation_counter_{0};
+
+
+    /*
+     * MapPoints也不需要30 Hz发布。
+     *
+     * 使用独立计数器降低RViz地图点发布频率。
+     */
+    std::uint32_t map_points_decimation_counter_{0};
+
+
+    /*
+     * ==========================================================
+     * MapPoint通信Batch独立计数器
+     * ==========================================================
+     *
+     * 与/orbslam3/map_points完全独立。
+     *
+     * 后续可以让：
+     *
+     * RViz发布频率
+     *
+     * 与
+     *
+     * UART/LoRa Batch频率
+     *
+     * 分别调整。
+     */
+    std::uint32_t map_batch_decimation_counter_{0};
+
+
+    /*
+     * ==========================================================
+     * 已经进入过ADD Batch的MapPoint ID
+     * ==========================================================
+     *
+     * 当前阶段：
+     *
+     * ID进入Batch
+     *
+     * 就暂时认为：
+     *
+     * 已经成功发送。
+     *
+     * 后续加入UART + LoRa + ACK以后，
+     * 这里会升级为pending / ACK同步机制。
+     */
+    std::unordered_set<unsigned long>
+        sent_map_point_ids_;
+
+
+    /*
+     * 只在跟踪状态变化的时候打印状态。
+     *
+     * 避免终端30 FPS刷屏。
+     */
+    int last_tracking_state_{-999};
+
+
+    /*
+     * 判断程序退出时是否存在有效轨迹。
+     *
+     * 只有产生有效位姿以后，
+     * 才调用ORB-SLAM3轨迹保存接口。
+     */
+    bool has_valid_pose_{false};
+};
+
+
+#endif
