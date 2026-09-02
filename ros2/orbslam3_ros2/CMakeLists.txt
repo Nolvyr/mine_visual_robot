@@ -123,7 +123,8 @@ target_link_libraries(stereo Threads::Threads)
 target_sources(stereo PRIVATE src/comm/map_producer.cpp)
 target_link_libraries(stereo "${comm_typesupport}")
 
-add_executable(serial_gateway_node src/comm/serial_gateway_node.cpp src/comm/uart_transport.cpp)
+add_executable(serial_gateway_node src/comm/serial_gateway_node.cpp
+  src/comm/uart_transport.cpp src/comm/v3_ack_decoder.cpp)
 ament_target_dependencies(serial_gateway_node rclcpp)
 target_link_libraries(serial_gateway_node comm_packet_encoder "${comm_typesupport}")
 
@@ -132,6 +133,9 @@ if(BUILD_TESTING)
   target_link_libraries(uart_transport_test comm_packet_encoder util)
   add_test(NAME uart_transport_test COMMAND uart_transport_test)
   set_tests_properties(uart_transport_test PROPERTIES TIMEOUT 10)
+  add_executable(v3_ack_decoder_test test/v3_ack_decoder_test.cpp src/comm/v3_ack_decoder.cpp)
+  target_include_directories(v3_ack_decoder_test PRIVATE include)
+  add_test(NAME v3_ack_decoder_test COMMAND v3_ack_decoder_test)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   add_executable(gateway_producer_test test/gateway_producer_test.cpp
     src/comm/map_producer.cpp src/comm/comm_map_commit.cpp)
@@ -141,7 +145,7 @@ if(BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/run_gateway_test.py
       $<TARGET_FILE:serial_gateway_node> $<TARGET_FILE:gateway_producer_test>)
   set_tests_properties(gateway_ros_integration PROPERTIES TIMEOUT 50 RUN_SERIAL TRUE)
-  foreach(mode uart unavailable)
+  foreach(mode uart uart_bad_ack uart_no_ack unavailable)
     add_test(NAME gateway_${mode}_integration
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/run_gateway_test.py
         $<TARGET_FILE:serial_gateway_node> $<TARGET_FILE:gateway_producer_test> ${mode})

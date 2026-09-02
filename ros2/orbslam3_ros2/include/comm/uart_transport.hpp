@@ -3,6 +3,7 @@
 #include "comm/transport.hpp"
 #include <string>
 #include <functional>
+#include <vector>
 #include <sys/types.h>
 #include <termios.h>
 namespace comm
@@ -22,6 +23,7 @@ public:
     UartTransport(const UartTransport&) = delete;
     UartTransport& operator=(const UartTransport&) = delete;
     bool Send(const std::vector<std::uint8_t>& bytes) override;
+    std::vector<std::uint8_t> ReadAvailable(std::size_t max_bytes = 512);
     void Close() noexcept;
 private:
     int fd_{-1};

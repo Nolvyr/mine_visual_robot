@@ -54,6 +54,11 @@ int main()
         Reject([&] { comm::UartTransport second(pty.name,115200); });
         Check(uart.Send(packet),"Send191");
         Check(pty.Read(191)==packet,"PTY bytes differ from V3 golden encoder");
+        const std::vector<std::uint8_t> ack{0xAA,0x55,0x03,0x30,0xF0,0x01,0x04,0x03,0x02,0x01,0x00,0x06,0x00,0x78,0x56,0x34,0x12,0x10,0x00,0x17,0xE1};
+        Check(write(pty.master,ack.data(),ack.size())==static_cast<ssize_t>(ack.size()),"write ACK");
+        std::vector<std::uint8_t> received;
+        for(int attempt=0;attempt<20&&received.empty();++attempt){received=uart.ReadAvailable();if(received.empty())usleep(1000);}
+        Check(received==ack,"UART ACK read differs from STM32 golden");
         int calls=0;
         Check(comm::detail::WriteAll(pty.slave,packet,100,
             [&](int fd,const void* bytes,std::size_t n)->ssize_t {
@@ -80,7 +85,7 @@ int main()
         comm::UartTransport failed(unplugged.name,115200,100);
         close(unplugged.master); unplugged.master=-1;
         Check(!failed.Send(packet) && !failed.Send(packet),"disconnect must fail closed");
-        std::cout<<"UART PTY PASS: 191B golden, 8N1, exclusive, partial/EINTR/EAGAIN, timeout, EIO, close, disconnect\n";
+        std::cout<<"UART PTY PASS: 191B TX + 21B STM32 ACK RX, 8N1, exclusive, partial/EINTR/EAGAIN, timeout, EIO, close, disconnect\n";
         return 0;
     }
     catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }

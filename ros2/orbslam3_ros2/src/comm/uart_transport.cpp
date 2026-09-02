@@ -101,4 +101,18 @@ bool UartTransport::Send(const std::vector<std::uint8_t>& bytes)
     if (!success) Close();
     return success;
 }
+std::vector<std::uint8_t> UartTransport::ReadAvailable(const std::size_t max_bytes)
+{
+    if (fd_ < 0 || max_bytes == 0 || max_bytes > 4096) return {};
+    std::vector<std::uint8_t> bytes(max_bytes);
+    for (;;)
+    {
+        const ssize_t count = ::read(fd_, bytes.data(), bytes.size());
+        if (count > 0) { bytes.resize(static_cast<std::size_t>(count)); return bytes; }
+        if (count == 0 || errno == EAGAIN || errno == EWOULDBLOCK) return {};
+        if (errno == EINTR) continue;
+        const std::system_error error(errno, std::generic_category(), "read UART");
+        Close(); throw error;
+    }
+}
 }

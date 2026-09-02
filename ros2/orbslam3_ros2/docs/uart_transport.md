@@ -17,7 +17,7 @@ STM32 RX 与 S100 TX 交叉连接并共地；电平、复用与波特率按板�
 ```bash
 ros2 run orbslam3 serial_gateway_node --ros-args \
   -p transport_mode:=uart -p serial_device:=/dev/ttyS2 \
-  -p baud_rate:=115200 -p write_timeout_ms:=250 \
+  -p baud_rate:=115200 -p write_timeout_ms:=250 -p ack_timeout_ms:=1000 \
   -p destination_id:=240 -p ttl:=3
 ```
 
@@ -40,6 +40,9 @@ Stereo 沿用已有相机、标定、词典与图像 remap，使用 `comm_mode:=
 - EINTR/EAGAIN 继续当前帧，受单次总超时约束；不是协议重发。
 - 完整字节被 Linux 驱动接受才返回 true → TRANSPORT_SENT。
 - 不使用可能无限阻塞的 tcdrain；成功不证明最后一个字节已经出 TX，更不是 STM32 ACK。
+- UART 模式同时非阻塞接收 STM32 返回的 21B Packet V3 ACK。
+- ACK 必须通过 CRC，且 source/destination、session、sequence、原 message type 和 status 全部匹配，才打印 `[RxACK] ... status=RECEIVED peer=STM32`。
+- `ack_timeout_ms` 内没有匹配确认时打印 `[ACK_TIMEOUT]`；本阶段不自动重发。
 - 写入0、超时、断开、系统错误返回 false 并关闭设备，之后请求均 FAILED。
 - 打开/配置失败时网关保持在线返回 FAILED；不会偷偷回退 simulated。
 - 无自动重连或失败帧重放；修复硬件后手动重启网关。
@@ -53,13 +56,13 @@ Stereo 沿用已有相机、标定、词典与图像 remap，使用 `comm_mode:=
 ## 验证步骤
 
 1. 先运行 CTest 的 UART 伪终端和既有 V3 golden 测试。
-2. 确认 STM32 同波特率8N1；本阶段只接收缓存并打印长度和HEX，不执行运动指令。
+2. 确认 STM32 同波特率8N1，并运行已经实现 V3 ACK 的固件。
 3. 单独启动一个 uart 网关及现有 Stereo+RealSense。
 4. 选择日志中 points=13 的全 ADD 包，S100 应记录 packet=191B、complete local write。
-5. STM32 按流累计，不能把一次中断/一次read当作一帧；核对 AA 55 03 10、长度与全部HEX。
+5. STM32 按流累计并校验后返回 ACK；S100 应打印匹配的 `[RxACK]`。
 6. V3头偏移11..12是小端 Payload Length，整包长度=13+PayloadLength+2。
 7. 对应实际 session/seq 核对。固定 golden session=12345678、seq=01020304、ttl=3
    的13 ADD为191B，CRC=4659，尾字节59 46；实际运行不同会话/序列会改变CRC。
 
-本轮不烧写 STM32，不实现 parser/E200/ACK/重试/YOLO。
-伪终端成功只证明 Linux字节路径，不证明物理 S100→STM32 已打通。
+ACK 的 `RECEIVED` 仅证明 STM32 接收了完整且 CRC 正确的 V3 帧，不代表地图应用、LoRa 转发或持久化成功。按照当前协议扩展，它不改变既有 TRANSPORT_SENT/CommMap commit 行为。本轮不修改或烧写 STM32，不实现 E200、ACK 重试或 YOLO。
+伪终端成功只证明 Linux 双向字节路径，不证明物理 S100↔STM32 已打通。
